@@ -13,6 +13,7 @@
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/mtd/bbt_store.h>
 #include <linux/mtd/spinand.h>
 #include <linux/of.h>
 #include <linux/slab.h>
@@ -570,7 +571,7 @@ static int spinand_read_page(struct spinand_device *spinand,
 			     const struct nand_page_io_req *req)
 {
 	struct nand_device *nand = spinand_to_nand(spinand);
-	u8 status;
+	u8 status = 0;
 	int ret;
 
 	ret = nand_ecc_prepare_io_req(nand, (struct nand_page_io_req *)req);
@@ -585,6 +586,16 @@ static int spinand_read_page(struct spinand_device *spinand,
 			   SPINAND_READ_INITIAL_DELAY_US,
 			   SPINAND_READ_POLL_DELAY_US,
 			   &status);
+	/*
+	 * When there is data outside of OIP in the status, the status data is
+	 * inaccurate and needs to be reconfirmed
+	 */
+	if (spinand->id.data[0] == 0x01 && status && !ret) {
+		ret = spinand_wait(spinand,
+				   SPINAND_READ_INITIAL_DELAY_US,
+				   SPINAND_READ_POLL_DELAY_US,
+				   &status);
+	}
 	if (ret < 0)
 		return ret;
 
@@ -792,6 +803,9 @@ static int spinand_mtd_block_markbad(struct mtd_info *mtd, loff_t offs)
 	ret = nanddev_markbad(nand, &pos);
 	mutex_unlock(&spinand->lock);
 
+	if (IS_ENABLED(CONFIG_MTD_NAND_BBT_USING_FLASH))
+		nanddev_bbt_in_flash_update(nand);
+
 	return ret;
 }
 
@@ -938,12 +952,26 @@ static const struct nand_ops spinand_ops = {
 
 static const struct spinand_manufacturer *spinand_manufacturers[] = {
 	&ato_spinand_manufacturer,
+	&biwin_spinand_manufacturer,
+	&dosilicon_spinand_manufacturer,
+	&esmt_spinand_manufacturer,
+	&etron_spinand_manufacturer,
+	&fmsh_spinand_manufacturer,
+	&foresee_spinand_manufacturer,
 	&gigadevice_spinand_manufacturer,
+	&gsto_spinand_manufacturer,
+	&hyf_spinand_manufacturer,
+	&jsc_spinand_manufacturer,
 	&macronix_spinand_manufacturer,
 	&micron_spinand_manufacturer,
 	&paragon_spinand_manufacturer,
+	&silicongo_spinand_manufacturer,
+	&skyhigh_spinand_manufacturer,
 	&toshiba_spinand_manufacturer,
+	&unim_spinand_manufacturer,
+	&unim_zl_spinand_manufacturer,
 	&winbond_spinand_manufacturer,
+	&xincun_spinand_manufacturer,
 	&xtx_spinand_manufacturer,
 };
 
@@ -1182,6 +1210,13 @@ static int spinand_init_flash(struct spinand_device *spinand)
 		if (ret)
 			break;
 
+		/* HWP_EN must be enabled first before block unlock region is set */
+		if (spinand->id.data[0] == 0x01) {
+			ret = spinand_lock_block(spinand, HWP_EN);
+			if (ret)
+				return ret;
+		}
+
 		ret = spinand_lock_block(spinand, BL_ALL_UNLOCKED);
 		if (ret)
 			break;
@@ -1189,6 +1224,22 @@ static int spinand_init_flash(struct spinand_device *spinand)
 
 	if (ret)
 		spinand_manufacturer_cleanup(spinand);
+
+	return ret;
+}
+
+/**
+ * spinand_mtd_suspend - [MTD Interface] Suspend the spinand flash
+ * @mtd: MTD device structure
+ *
+ * Returns 0 for success or negative error code otherwise.
+ */
+static int spinand_mtd_suspend(struct mtd_info *mtd)
+{
+	struct spinand_device *spinand = mtd_to_spinand(mtd);
+	int ret = 0;
+
+	mutex_lock(&spinand->lock);
 
 	return ret;
 }
@@ -1207,6 +1258,18 @@ static void spinand_mtd_resume(struct mtd_info *mtd)
 		return;
 
 	spinand_ecc_enable(spinand, false);
+
+	mutex_unlock(&spinand->lock);
+}
+
+/**
+ * spinand_mtd_shutdown - [MTD Interface] Finish the current spinand operation and
+ *                 prevent further operations
+ * @mtd: MTD device structure
+ */
+static void spinand_mtd_shutdown(struct mtd_info *mtd)
+{
+	spinand_mtd_suspend(mtd);
 }
 
 static int spinand_init(struct spinand_device *spinand)
@@ -1272,6 +1335,8 @@ static int spinand_init(struct spinand_device *spinand)
 	mtd->_erase = spinand_mtd_erase;
 	mtd->_max_bad_blocks = nanddev_mtd_max_bad_blocks;
 	mtd->_resume = spinand_mtd_resume;
+	mtd->_suspend = spinand_mtd_suspend;
+	mtd->_reboot = spinand_mtd_shutdown;
 
 	if (nand->ecc.engine) {
 		ret = mtd_ooblayout_count_freebytes(mtd);
@@ -1292,6 +1357,11 @@ static int spinand_init(struct spinand_device *spinand)
 			ret);
 		goto err_cleanup_ecc_engine;
 	}
+	if (IS_ENABLED(CONFIG_SPI_ROCKCHIP_SFC))
+		mtd->name = "spi-nand0";
+
+	if (IS_ENABLED(CONFIG_MTD_NAND_BBT_USING_FLASH))
+		nanddev_scan_bbt_in_flash(nand);
 
 	return 0;
 
