@@ -54,6 +54,10 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/ipi.h>
 
+#if IS_ENABLED(CONFIG_ROCKCHIP_MINIDUMP)
+#include <soc/rockchip/rk_minidump.h>
+#endif
+
 DEFINE_PER_CPU_READ_MOSTLY(int, cpu_number);
 EXPORT_PER_CPU_SYMBOL(cpu_number);
 
@@ -818,6 +822,10 @@ void arch_irq_work_raise(void)
 
 static void local_cpu_stop(void)
 {
+	if (system_state <= SYSTEM_RUNNING) {
+		pr_crit("CPU%u: stopping\n", smp_processor_id());
+		dump_stack();
+	}
 	set_cpu_online(smp_processor_id(), false);
 
 	local_daif_mask();
@@ -877,6 +885,9 @@ static void do_handle_IPI(int ipinr)
 		break;
 
 	case IPI_CPU_STOP:
+#if IS_ENABLED(CONFIG_ROCKCHIP_MINIDUMP)
+		rk_minidump_update_cpu_regs(get_irq_regs());
+#endif
 		local_cpu_stop();
 		break;
 
